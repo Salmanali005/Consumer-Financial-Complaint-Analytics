@@ -1,192 +1,320 @@
 # Consumer Financial Complaint Analytics Lakehouse
 
-An end-to-end data lakehouse pipeline built on Apache Spark and Delta Lake using the Medallion Architecture (Bronze, Silver, Gold) to ingest real consumer complaint data from the CFPB, validate and deduplicate records, model it as a star schema, and serve it to Power BI together with pipeline audit logs.
+An end-to-end data lakehouse platform built on Apache Spark and Delta Lake using the Medallion Architecture (Bronze, Silver, Gold) to ingest real consumer complaint records from the Consumer Financial Protection Bureau (CFPB) API, validate and quarantine malformed records, model the cleansed data into a Kimball Star Schema, and serve interactive analytics through a 3-page Microsoft Power BI reporting suite alongside real-time pipeline audit telemetry.
 
 ---
 
 ## Project Overview
-- **Domain:** Financial Services / Consumer Complaint & Risk Analytics
-- **Data Source:** CFPB Consumer Complaint Database API — real, live, publicly available complaint records against financial companies, fetched using Elasticsearch `search_after` cursor pagination.
-- **Platform Stack:** Databricks (Apache Spark), Delta Lake, Python / PySpark, Power BI
-- **Course:** Data Analysis and Visualization — Semester Project (Phase 3 Complete)
-- **Project Team:**
-  - Salman Ali — Roll Number: 24L2542
-  - Ahmad Khan — Roll Number: 24L2541
+
+* **Domain:** Financial Services / Consumer Dispute & Regulatory Risk Analytics
+
+
+* **Data Source:** CFPB Consumer Complaint Database API — live, publicly available complaint records against financial institutions, fetched via cursor pagination (`search_after`).
+
+
+* **Platform Stack:** Databricks (Apache Spark), Delta Lake, Python / PySpark, Microsoft Power BI Desktop (Import Mode via Databricks SQL Warehouse).
+
+
+* **Course:** Data Analysis and Visualization — Semester Project (Phase 3 Complete)
+
+
+* **Project Team:**
+* Muhammad Ahmad Khan — Roll Number: 24L-2541
+* Muhammad Salman Ali — Roll Number: 24L-2542
+
+
+
+
 
 ---
 
 ## Why This Data Source
-Unlike a static synthetic dataset, the CFPB API provides genuinely live data: a Full Load is pulled as a historical baseline over a fixed date range, and an Incremental Load is pulled separately for complaints received after that cutoff — mirroring how a real production pipeline ingests new records as they arrive.
+
+Unlike static synthetic datasets, the CFPB API provides authentic production data:
+
+1. **Full Baseline Load:** Historical baseline extracted across an initial fixed time window.
+
+
+2. **Incremental Delta Loads:** New records extracted dynamically after the established watermark date.
+
+
+3. **Cursor Pagination:** Handles high-volume daily batches using the API's Elasticsearch `search_after` cursor, circumventing the default 1,000-row query ceiling.
+
+
 
 ---
 
-## Architecture: Medallion Pipeline
-The lakehouse pipeline processes complaint data across distinct, fault-tolerant tiers:
+## Architecture: Medallion Lakehouse Pipeline
 
-    Raw Data (CFPB API — JSON via search_after)
-              │
-              ▼
+```text
+    Raw Data (CFPB REST API — JSON via search_after cursor)
+                           │
+                           ▼
 ┌────────────────────────────────────────────────────────┐
-│             Bronze Layer (Delta Lake)                  │  <-- Raw Ingestion + Audit Metadata
-│  - Partitioned by run_date with idempotent overwrite   │      (load_timestamp, batch_id, run_date)
-│  - Schema drift: new columns kept in extra_columns     │
-└────────────────────┬───────────────────────────────────┘
-                     │
-                     ▼
+│     Landing / Volume Staging (Compressed CSV)          │
+│  - /Volumes/workspace/complaints/raw_data              │
+└──────────────────────────┬─────────────────────────────┘
+                           │ 03_raw_to_bronze
+                           ▼
 ┌────────────────────────────────────────────────────────┐
-│             Silver Layer (Delta Lake)                  │  <-- Cleansed & Standardized
-│  - Try-to-timestamp date parsing & type casting        │  - Duplicate Complaint Removal (Window)
-│  - Quarantine routing for malformed records            │  - Idempotent MERGE INTO deduplication
-└────────────────────┬───────────────────────────────────┘
-                     │
-                     ▼
+│             Bronze Layer (Delta Lake)                  │  <-- Raw Ingestion & Lineage Metadata
+│  - Table: workspace.complaints.bronze_complaints       │      (load_timestamp, batch_id, run_date)
+│  - Partitioned by run_date with replaceWhere overwrite │  - Preserves schema-on-read as strings
+│  - Schema drift captured via extra_columns             │
+└──────────────────────────┬─────────────────────────────┘
+                           │ 04_bronze_to_silver
+                           ▼
 ┌────────────────────────────────────────────────────────┐
-│             Gold Layer (Delta Lake, Star Schema)       │  <-- Business-ready model
-│  - dim_product, dim_company, dim_location, dim_date    │  - Hash surrogate keys
-│  - fact_complaints (MERGE on complaint_id)             │  - OPTIMIZE + ZORDER for reads
-└────────────────────┬───────────────────────────────────┘
-                     │
-                     ▼
-┌────────────────────────────────────────────────────────┐
-│     Power BI (Databricks SQL Warehouse, Import mode)   │  <-- Executive dashboard +
-│  - Star schema semantic model, DAX measures            │      pipeline audit monitor
-└────────────────────────────────────────────────────────┘
+│             Silver Layer (Delta Lake)                  │  <-- Cleansed, Validated & Typed
+│  - Table: workspace.complaints.silver_complaints       │  - Safe try_to_timestamp parsing
+│  - Window deduplication (rn = 1 on load_timestamp)     │  - Idempotent MERGE on complaint_id
+└─────────────┬────────────────────────────┬─────────────┘
+              │ (Fails Validation)         │ (Clean Records)
+              ▼                            ▼
+┌───────────────────────────┐ ┌────────────────────────────────────────────────────────┐
+│     Silver Quarantine     │ │             Gold Layer (Kimball Star Schema)           │
+│  - silver_quarantine      │ │  - Dimensions: dim_product, dim_company,               │
+│  - Isolated corrupt rows  │ │    dim_location, dim_date (SHA-256 surrogate keys)     │
+│  - Reason & audit logging │ │  - Fact: fact_complaints (MERGE on complaint_id)       │
+└───────────────────────────┘ │  - Performance: OPTIMIZE ZORDER BY (date_received_id)  │
+                              └────────────────────────────┬───────────────────────────┘
+                                                           │ Databricks SQL Warehouse
+                                                           ▼
+                              ┌────────────────────────────────────────────────────────┐
+                              │            Serving Layer (Microsoft Power BI)          │
+                              │  - Page 1: Executive Complaint Intelligence            │
+                              │  - Page 2: Dispute & Root-Cause Analytics              │
+                              │  - Page 3: Pipeline Observability & Audit Telemetry     │
+                              └────────────────────────────────────────────────────────┘
 
-          Audit Logging & Orchestration (all layers)
-          pipeline_execution_logs · pipeline_watermark · silver_quarantine
+              Operational Monitoring (All Layers):
+              pipeline_execution_logs · pipeline_watermark · silver_quarantine
+
+```
 
 ---
 
 ## Data Models & Schemas
 
 ### 1. Bronze Table (`workspace.complaints.bronze_complaints`)
-- **Description:** Raw ingestion layer storing unvalidated complaint data as strings, partitioned by ingestion date (`run_date`). New source columns that are not part of the expected contract are not dropped; they are stored as JSON in `extra_columns`.
-- **Primary Key:** None (Append / Partition Overwrite layer)
+
+Raw ingestion layer storing source records as strings to prevent ingest failures from upstream schema changes. Physically partitioned by `run_date`.
 
 | Column Name | Data Type | Nullable | Description |
-|---|---|---|---|
-| `complaint_id` | string | yes | Raw complaint identifier |
-| `date_received` | string | yes | Raw date complaint was received |
-| `product` | string | yes | Financial product category |
-| `sub_product` | string | yes | Sub-product classification |
-| `issue` | string | yes | Primary issue reported |
-| `sub_issue` | string | yes | Secondary issue reported |
-| `company` | string | yes | Target company name |
-| `state` | string | yes | State abbreviation |
-| `zip_code` | string | yes | Postal code |
-| `submitted_via` | string | yes | Intake channel |
-| `date_sent_to_company` | string | yes | Raw date forwarded to company |
-| `company_response` | string | yes | Company response status |
-| `timely` | string | yes | Timeliness indicator flag |
-| `company_public_response` | string | yes | Public response text |
-| `tags` | string | yes | Additional complaint tags |
-| `load_timestamp` | timestamp | **no** | Timestamp when ingested into Bronze |
-| `source_file` | string | yes | Source CSV/API batch file name |
-| `batch_id` | string | yes | Unique batch execution ID |
-| `load_type` | string | yes | Ingestion mode (`incremental` / `full`) |
-| `run_date` | date | yes | Partition date for idempotent overwrites |
-| `extra_columns` | string | yes | JSON of any new source columns (schema drift) |
+| --- | --- | --- | --- |
+| `complaint_id` | string | yes | Raw complaint identifier
+
+ |
+| `date_received` | string | yes | Raw date received by CFPB
+
+ |
+| `product` | string | yes | Financial product category
+
+ |
+| `sub_product` | string | yes | Sub-product classification
+
+ |
+| `issue` | string | yes | Primary issue reported
+
+ |
+| `sub_issue` | string | yes | Secondary issue reported
+
+ |
+| `company` | string | yes | Regulated financial company name
+
+ |
+| `state` | string | yes | Two-letter state postal abbreviation
+
+ |
+| `zip_code` | string | yes | Postal code (often masked at source)
+
+ |
+| `submitted_via` | string | yes | Intake channel (Web, Phone, Referral, etc.)
+
+ |
+| `date_sent_to_company` | string | yes | Raw date forwarded to financial institution
+
+ |
+| `company_response` | string | yes | Formal response classification
+
+ |
+| `timely` | string | yes | Raw timeliness indicator
+
+ |
+| `company_public_response` | string | yes | Public remarks from the company
+
+ |
+| `tags` | string | yes | Consumer demographic/military tags
+
+ |
+| `load_timestamp` | timestamp | **no** | UTC ingestion timestamp
+
+ |
+| `source_file` | string | yes | Source file name
+
+ |
+| `batch_id` | string | yes | Unique batch execution UUID
+
+ |
+| `load_type` | string | yes | Ingestion mode (`incremental` / `full` / `backfill`)
+
+ |
+| `run_date` | date | yes | Partitioning date for atomic directory overwrites
+
+ |
+| `extra_columns` | string | yes | JSON payload capturing unmapped schema drift columns
+
+ |
 
 ---
 
 ### 2. Silver Table (`workspace.complaints.silver_complaints`)
-- **Description:** Cleaned, validated, and type-cast analytical table with strict primary key constraints and idempotent deduplication via `MERGE INTO`.
-- **Primary Key:** `complaint_id`
+
+Cleansed, validated, and type-cast analytical table with deduplication committed via Delta `MERGE INTO`.
 
 | Column Name | Data Type | Nullable | Key | Description |
-|---|---|---|---|---|
-| `complaint_id` | string | **no** | **PK** | Unique complaint identifier |
-| `date_received` | timestamp | yes | | Parsed timestamp of receipt |
-| `date_sent_to_company` | timestamp | yes | | Parsed timestamp forwarded to company |
-| `product` | string | yes | | Normalized product category |
-| `sub_product` | string | yes | | Normalized sub-product |
-| `issue` | string | yes | | Primary issue |
-| `sub_issue` | string | yes | | Secondary issue |
-| `company` | string | yes | | Company name |
-| `state` | string | yes | | State code |
-| `zip_code` | string | yes | | Postal code |
-| `submitted_via` | string | yes | | Intake channel |
-| `company_response` | string | yes | | Company response status |
-| `company_public_response` | string | yes | | Public response |
-| `timely` | boolean | yes | | Timeliness boolean flag |
-| `tags` | string | yes | | Complaint tags |
-| `load_timestamp` | timestamp | **no** | | Timestamp of last load/refresh |
-| `batch_id` | string | yes | | Batch identifier |
+| --- | --- | --- | --- | --- |
+| `complaint_id` | string | **no** | **PK** | Unique complaint identifier
+
+ |
+| `date_received` | timestamp | yes |  | Parsed receipt timestamp (`try_to_timestamp`)
+
+ |
+| `date_sent_to_company` | timestamp | yes |  | Parsed forwarded timestamp (`try_to_timestamp`)
+
+ |
+| `product` | string | yes |  | Cleansed product category
+
+ |
+| `sub_product` | string | yes |  | Cleansed sub-product category
+
+ |
+| `issue` | string | yes |  | Primary dispute issue
+
+ |
+| `sub_issue` | string | yes |  | Secondary root issue
+
+ |
+| `company` | string | yes |  | Standardized financial institution name
+
+ |
+| `state` | string | yes |  | Cleaned US jurisdiction state code
+
+ |
+| `zip_code` | string | yes |  | Cleaned ZIP code
+
+ |
+| `submitted_via` | string | yes |  | Intake channel
+
+ |
+| `company_response` | string | yes |  | Standardized response status
+
+ |
+| `company_public_response` | string | yes |  | Public company remarks
+
+ |
+| `timely` | boolean | yes |  | Standardized compliance boolean flag
+
+ |
+| `tags` | string | yes |  | Categorical tags
+
+ |
+| `load_timestamp` | timestamp | **no** |  | UTC timestamp of last record mutation
+
+ |
+| `batch_id` | string | yes |  | Batch identifier
+
+ |
 
 ---
 
 ### 3. Quarantine Table (`workspace.complaints.silver_quarantine`)
-- **Description:** Rows that fail validation in Bronze → Silver (empty `complaint_id` or unparseable `date_received`). They are kept for inspection and never block the rest of the batch.
-- **Columns:** the 15 raw string columns, plus `quarantine_reason` (string), `source_file` (string), `batch_id` (string), `run_date` (date), `load_timestamp` (timestamp, not null).
+
+Isolates records that fail critical quality constraints (missing `complaint_id` or non-parseable timestamps).
+
+* **Columns:** All 15 raw source string fields plus `quarantine_reason` (string), `source_file` (string), `batch_id` (string), `run_date` (date), and `load_timestamp` (timestamp).
+
+
 
 ---
 
 ### 4. Gold Star Schema (`workspace.complaints.*`)
-- **Description:** Business-ready dimensional model built from Silver. One fact table (one row per complaint) and four dimensions. Dimension keys are deterministic SHA-256 hashes of the natural key, so rebuilding a dimension never changes the keys already stored in the fact table.
 
-**`fact_complaints`** — Primary Key: `complaint_id`
+Optimized Kimball dimensional model. Dimension surrogate keys are constructed using deterministic SHA-256 hashes of natural keys, enabling parallel cluster rebuilds without foreign-key invalidation.
+
+#### `fact_complaints` (Primary Key: `complaint_id`)
+
+
 
 | Column Name | Data Type | Key | Description |
-|---|---|---|---|
-| `complaint_id` | string | **PK** | Unique complaint identifier |
-| `product_id` | string | FK → `dim_product` | Product / sub-product key |
-| `company_id` | string | FK → `dim_company` | Company key |
-| `location_id` | string | FK → `dim_location` | State / ZIP key |
-| `date_received_id` | bigint | FK → `dim_date.date_key` | Date received (`yyyyMMdd`) |
-| `date_sent_id` | bigint | FK → `dim_date.date_key` | Date sent to company (`yyyyMMdd`) |
-| `issue` | string | | Primary issue |
-| `sub_issue` | string | | Secondary issue |
-| `company_response` | string | | Company response status |
-| `company_public_response` | string | | Public response |
-| `submitted_via` | string | | Intake channel |
-| `timely_flag` | int | | 1 = timely response, 0 = not timely |
-| `days_to_send` | int | | Days between receipt and forwarding to company |
-| `load_timestamp` | timestamp | | When the Gold row was loaded |
+| --- | --- | --- | --- |
+| `complaint_id` | string | **PK / DD** | Source CFPB complaint identifier (Degenerate Dimension)
 
-**`dim_product`** — Primary Key: `product_id`
+ |
+| `product_id` | string | FK → `dim_product` | Deterministic SHA-256 key linking to `dim_product`
 
-| Column Name | Data Type | Key |
-|---|---|---|
-| `product_id` | string | **PK** |
-| `product` | string | |
-| `sub_product` | string | |
+ |
+| `company_id` | string | FK → `dim_company` | Deterministic SHA-256 key linking to `dim_company`
 
-**`dim_company`** — Primary Key: `company_id`
+ |
+| `location_id` | string | FK → `dim_location` | Deterministic SHA-256 key linking to `dim_location`
 
-| Column Name | Data Type | Key |
-|---|---|---|
-| `company_id` | string | **PK** |
-| `company` | string | |
+ |
+| `date_received_id` | bigint | FK → `dim_date.date_key` | Numeric date key (`yyyyMMdd`) for received date
 
-**`dim_location`** — Primary Key: `location_id`
+ |
+| `date_sent_id` | bigint | FK → `dim_date.date_key` | Numeric date key (`yyyyMMdd`) for forwarded date
 
-| Column Name | Data Type | Key |
-|---|---|---|
-| `location_id` | string | **PK** |
-| `state` | string | |
-| `zip_code` | string | |
+ |
+| `issue` | string |  | Primary complaint issue
 
-**`dim_date`** — Primary Key: `date_key`
+ |
+| `sub_issue` | string |  | Fine-grained complaint root issue
 
-| Column Name | Data Type | Key |
-|---|---|---|
-| `date_key` | bigint | **PK** |
-| `date` | date | |
-| `year` | int | |
-| `quarter` | int | |
-| `month` | int | |
-| `month_name` | string | |
-| `day` | int | |
-| `day_of_week` | string | |
+ |
+| `company_response` | string |  | Categorized response code
 
-#### Entity-Relationship Diagram
+ |
+| `company_public_response` | string |  | Public response text
+
+ |
+| `submitted_via` | string |  | Intake submission channel
+
+ |
+| `timely_flag` | int | Metric | Binary compliance flag ($1 = \text{Yes}, 0 = \text{No}$)
+
+ |
+| `days_to_send` | int | Metric | Forwarding latency: $\text{DATEDIFF}(\text{date\_sent}, \text{date\_received})$
+
+ |
+| `load_timestamp` | timestamp | Audit | UTC timestamp when loaded into Gold
+
+ |
+
+#### Dimension Tables
+
+
+
+* **`dim_product`:** `product_id` (PK, SHA-256), `product`, `sub_product`.
+
+
+* **`dim_company`:** `company_id` (PK, SHA-256), `company`.
+
+
+* **`dim_location`:** `location_id` (PK, SHA-256), `state`, `zip_code`.
+
+
+* **`dim_date`:** `date_key` (PK, bigint `yyyyMMdd`), `date` (date), `year` (int), `quarter` (int), `month` (int), `month_name` (string), `day` (int), `day_of_week` (string).
+
+
 
 ```mermaid
 erDiagram
     dim_product  ||--o{ fact_complaints : "product_id"
     dim_company  ||--o{ fact_complaints : "company_id"
     dim_location ||--o{ fact_complaints : "location_id"
-    dim_date     ||--o{ fact_complaints : "date_key = date_received_id"
+    dim_date     ||--o{ fact_complaints : "date_key = date_received_id (Active)"
+    dim_date     |o--o{ fact_complaints : "date_key = date_sent_id (Inactive)"
 
     fact_complaints {
         string complaint_id PK
@@ -228,118 +356,219 @@ erDiagram
         int day
         string day_of_week
     }
+
 ```
 
-`date_sent_id` also references `dim_date.date_key` and is modelled as an inactive relationship in Power BI (only one active relationship is allowed between two tables).
+---
+
+### 5. Operational Telemetry Tables
+
+* **`workspace.complaints.pipeline_execution_logs`:** Captures step-level audit telemetry (`run_id`, `batch_id`, `layer`, `load_type`, `parameter`, `start_time`, `end_time`, `duration_seconds`, `status`, `rows_read`, `rows_inserted`, `rows_updated`, `rows_quarantined`, `error_message`). Powers Page 3 in Power BI.
+
+
+* **`workspace.complaints.pipeline_watermark`:** Tracks high-water mark metadata (`layer`, `last_processed_date`, `updated_at`, `last_batch_id`) to orchestrate incremental execution windows automatically.
+
+
 
 ---
 
-### 5. Operational Tables
-- **`pipeline_execution_logs`** — one row per logged run: `run_id`, `batch_id`, `layer`, `load_type`, `parameter`, `start_time`, `end_time`, `duration_seconds`, `status` (Success / Failure), `rows_read`, `rows_inserted`, `rows_updated`, `rows_quarantined`, `error_message`. Rows are written by the orchestrator (`orchestrator` layer) and by the Silver → Gold notebook (`gold` layer), and the table is the source of the audit page in Power BI.
-- **`pipeline_watermark`** — `layer`, `last_processed_date`, `updated_at`, `last_batch_id`. Auto mode uses it to decide which dates to pull next.
+## Pipeline Automation & Orchestration
+
+The master notebook **`Complaint-Analytics-Pipeline.ipynb`** chains all execution tiers together:
+
+1. **`02_ingest_api`:** Queries CFPB REST endpoints using `search_after` cursor pagination and stages CSV files in Unity Catalog Volumes.
+
+
+2. **`03_raw_to_bronze`:** Ingests raw data with lineage tracking and performs partition replacement (`replaceWhere = "run_date = '...'"`).
+3. **`04_bronze_to_silver`:** Validates schema, routes anomalies to `silver_quarantine`, executes window-based deduplication, and commits an idempotent `MERGE` into `silver_complaints`.
+
+
+4. **`05_silver_to_gold`:** Derives conforming dimensions, merges `fact_complaints`, and executes `OPTIMIZE ... ZORDER BY (date_received_id, product_id)` for accelerated read I/O.
+
+
+
+The pipeline safely exits downstream executions if the API reports `UP_TO_DATE`, `ALREADY_EXISTS`, or `NO_DATA`.
 
 ---
 
-## Pipeline Integration & Automation
-`Complaint-Analytics-Pipeline.ipynb` (Master Orchestrator) chains every step, so a new incremental load refreshes all layers automatically:
+## Business Intelligence (Power BI Desktop)
 
-1. `02_ingest_api` — pulls complaints from the CFPB API
-2. `03_raw_to_bronze` — loads Bronze
-3. `04_bronze_to_silver` — validates, quarantines and MERGEs into Silver
-4. `05_silver_to_gold` — rebuilds the dimensions, MERGEs the fact table, runs `OPTIMIZE ... ZORDER BY (date_received_id, product_id)`
+* **Connectivity:** Azure Databricks SQL Warehouse (Direct connection via Server Hostname, HTTP Path, and Personal Access Token) imported in **Import Mode** for sub-second visual performance.
 
-If the API reports `UP_TO_DATE`, `ALREADY_EXISTS` or `NO_DATA`, the downstream steps are skipped. The orchestrator can be scheduled as a Databricks Job for daily runs.
+
+* **Loaded Tables:** `fact_complaints`, `dim_product`, `dim_company`, `dim_location`, `dim_date`, `pipeline_execution_logs`, and `silver_quarantine`.
+
+
+* **Relationship Model:** Pure Star Schema with one-to-many (`1:*`) single-direction relationships from each dimension to `fact_complaints`.
+
+
+* **Role-Playing Calendar:**
+* Active: `dim_date[date_key]` $\longrightarrow$ `fact_complaints[date_received_id]`
+
+
+* Inactive: `dim_date[date_key]` $\dashrightarrow$ `fact_complaints[date_sent_id]`
+
+
+
+
+
+### Production DAX Measures (`_Measures` Table)
+
+```dax
+// 1. Total Complaint Volume
+Total Complaints = COUNTROWS('fact_complaints')
+
+// 2. Timely Compliance Response Rate (%)
+Timely Response Rate = 
+DIVIDE(
+    SUM('fact_complaints'[timely_flag]),
+    [Total Complaints],
+    0
+)
+
+// 3. Average Forwarding Latency to Company (Days)
+Avg Days to Route = AVERAGE('fact_complaints'[days_to_send])
+
+// 4. Untimely Escalations (SLA Violations)
+Untimely Complaints = 
+CALCULATE(
+    [Total Complaints],
+    'fact_complaints'[timely_flag] = 0
+)
+
+// 5. Inactive Relationship Measure: Forwarded Influx by Sent Date
+Complaints Sent by Date = 
+CALCULATE(
+    [Total Complaints],
+    USERELATIONSHIP('fact_complaints'[date_sent_id], 'dim_date'[date_key])
+)
+
+// 6. Total Pipeline Orchestration Runs
+Total Pipeline Runs = DISTINCTCOUNT('pipeline_execution_logs'[run_id])
+
+// 7. Pipeline Orchestration SLA Success Rate (%)
+Pipeline Success Rate = 
+VAR SuccessRuns = 
+    CALCULATE(
+        COUNTROWS('pipeline_execution_logs'), 
+        'pipeline_execution_logs'[status] = "Success"
+    )
+VAR TotalRuns = COUNTROWS('pipeline_execution_logs')
+RETURN 
+    COALESCE(DIVIDE(SuccessRuns, TotalRuns, 0), 0)
+
+// 8. Total Quarantined Anomalous Records
+Total Quarantined = SUM('pipeline_execution_logs'[rows_quarantined])
+
+// 9. Average Execution Latency per Layer (Seconds)
+Avg Run Duration (s) = AVERAGE('pipeline_execution_logs'[duration_seconds])
+
+```
 
 ---
 
-## Pipeline Run Guide
+### Dashboard Page Architecture (3-Page Layout)
 
-### 1. Running a Normal Incremental Load
-1. Open **`Complaint-Analytics-Pipeline.ipynb`** (Master Orchestrator).
-2. Set execution parameters:
-   - **`mode`**: `auto` (uses the watermark to pull lagging completed days; the window ends two days before today to allow for the CFPB publishing delay).
-   - **`load_type`**: `incremental`
-3. Click **Run All**. The orchestrator extracts via `search_after`, loads Bronze via partition overwrite (`replaceWhere`), merges into Silver, and refreshes the Gold star schema.
 
-### 2. Running a Historical Backfill
-1. Open **`Complaint-Analytics-Pipeline.ipynb`**.
-2. Set execution parameters:
-   - **`mode`**: `manual`
-   - **`start_date`**: `2026-10-01`
-   - **`end_date`**: `2026-10-01`
-   - **`load_type`**: `backfill`
-3. Click **Run All**. The pipeline fetches the historical window, validates date types safely using `try_to_timestamp`, routes invalid records to `silver_quarantine`, merges clean records without duplication, and refreshes Gold.
 
-### 3. Schema Drift Handling
-- **New source column:** detected in `03_raw_to_bronze`, reported as `SCHEMA DRIFT`, and stored as JSON in `extra_columns`; the batch still loads.
-- **Missing source column:** filled with `NULL`.
-- **Changed data type:** Bronze stores every field as a string, so it cannot fail there. In Silver, rows whose `date_received` or `complaint_id` no longer parse go to `silver_quarantine` with a reason while the rest of the batch continues.
+The Power BI report (`Consumer_Complaint_Analytics.pbix`) is structured into three dedicated, uncluttered pages to balance executive KPIs, deep institutional root-cause analysis, and data platform telemetry:
 
----
+```text
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Page 1: Executive Analytics (Consumer Complaint Intelligence)                                   │
+│  - Top Slicers: Date Range Slider ('dim_date'[date]) & Product Dropdown ('dim_product'[product])│
+│  - KPI Cards: Total Complaints | Timely Response Rate | Avg Days to Route | Untimely Complaints │
+│  - Visual 1 (Combo Chart): Intake vs. Routing Trend (Column: Received Date, Line: Sent Date)   │
+│  - Visual 2 (Donut Chart): Complaint Volume Share by Financial Product                         │
+│  - Visual 3 (Filled Map): Complaint Density Heatmap by US State (Auto-zoomed on USA)            │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-## Business Intelligence (Power BI)
-- **Connection:** Power BI Desktop connects to the Databricks SQL warehouse (Server Hostname + HTTP Path + personal access token) in **Import** mode.
-- **Tables loaded:** `fact_complaints`, `dim_product`, `dim_company`, `dim_location`, `dim_date`, `pipeline_execution_logs`, `silver_quarantine`.
-- **Semantic model:** one-to-many relationships from each dimension to `fact_complaints` (single direction, dimension → fact). `dim_date` is marked as the date table. The two audit tables are standalone.
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Page 2: Dispute Analytics (Institutional Dispute & Root-Cause Intelligence)                     │
+│  - Top Half (100% Stacked Bar): Top 10 Regulated Institutions Dispute Resolution Mix            │
+│    (Closed with explanation vs. Closed with monetary relief vs. Non-monetary relief)           │
+│  - Bottom Half (Clustered Bar Chart): Top 10 Consumer Pain Points & Root Issues                 │
+│    (Full-width horizontal bars showing volume breakdown for core dispute drivers)               │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-**DAX measures**
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Page 3: Pipeline Observability (Data Engineering Telemetry & Audit Trail)                       │
+│  - Slicers: Pipeline Layer ('layer') and Execution Status ('status')                            │
+│  - KPI Cards: Total Pipeline Runs | Pipeline Success Rate | Total Quarantined | Avg Duration    │
+│  - Visual 1 (Clustered Column): Layer Latency Profile (start_time vs. duration_seconds, <=150s) │
+│  - Visual 2 (Bar Chart): Ingestion Throughput per Batch (Top 10 Batches: Ingested vs. Quarantined│
+│  - Visual 3 (Data Grid): Comprehensive Pipeline Audit Trail Table (error_message pinned far     │
+│    right with Text Wrap disabled for clean single-line rows; conditional formatting on status)  │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 
-| Measure | Definition |
-|---|---|
-| Total Complaints | `COUNTROWS(fact_complaints)` |
-| Timely Rate | share of complaints with `timely_flag = 1` |
-| Avg Days to Send | `AVERAGE(fact_complaints[days_to_send])` |
-| Products Tracked | `DISTINCTCOUNT(dim_product[product])` |
-| Total Runs | `DISTINCTCOUNT(pipeline_execution_logs[run_id])` |
-| Success Rate | share of log rows with `status = "Success"` |
-| Rows Inserted / Rows Quarantined | sums of the matching log columns |
-| Avg Duration (s) | `AVERAGE(pipeline_execution_logs[duration_seconds])` |
-
-**Dashboard pages**
-1. **Executive Dashboard** — date, product and state slicers; KPI cards (total complaints, timely rate, average days to send, products tracked); monthly trend line; top products and top companies bars; complaints by state matrix.
-2. **Pipeline Operational Audit Monitor** — run, success-rate, rows and duration KPIs; duration and runs-by-status per layer; quarantine reasons; full execution-log audit table.
-
-The Power BI file is in the `Dashboard/` folder.
+```
 
 ---
 
-## Key Design Decisions
-| Decision | Reason |
-|---|---|
-| Bronze stores everything as strings | Raw data can never fail on a type surprise; casting and validation happen in Silver, where bad rows can be quarantined. |
-| Bronze partitioned by `run_date` with `replaceWhere` | A re-run replaces only its own day, so reloading the same day creates no duplicates. |
-| Silver and Gold fact use `MERGE INTO` on `complaint_id` | Inserts new complaints and updates changed ones; running the same input twice leaves the tables identical. |
-| Hash (SHA-256) surrogate keys in Gold | Deterministic, so dimensions can be rebuilt without breaking fact-table references. |
-| Dimensions overwritten, fact merged | Dimensions are small and derived from Silver; the fact table is large and should only change where data changed. |
-| `OPTIMIZE ... ZORDER BY (date_received_id, product_id)` | Co-locates data by the columns most used in dashboard filters. |
-| Power BI in Import mode | Faster visuals and no need to keep the SQL warehouse running (Free Edition has a usage quota). |
+## Key Engineering Decisions
 
-The architecture diagram, Spark UI DAG analysis, and cost / FinOps evaluation are in the final PDF report in the `docs/` folder.
+| Decision | Technical Justification |
+| --- | --- |
+| **Raw String Ingestion in Bronze**
+
+ | Prevents pipeline aborts caused by unannounced upstream API schema changes or field type mutations. Type casting occurs safely in Silver.
+
+ |
+| **Bronze Partitioning by `run_date**`
+
+ | Isolates daily batch storage directories, enabling atomic, idempotent partition overwrites (`replaceWhere`) without rewriting historical Parquet files.
+
+ |
+| **Idempotent Delta `MERGE INTO**`
+
+ | Prevents duplication when backfilling or re-running failed batches; existing `complaint_id` keys update in place while new records insert.
+
+ |
+| **Stateless SHA-256 Surrogate Keys**
+
+ | Generates deterministic, distributed surrogate keys without inter-worker locks or stateful `monotonically_increasing_id` sequence dependencies.
+
+ |
+| **Z-Ordering on Fact Table**
+
+ | Clusters Parquet files by `(date_received_id, product_id)`, enabling file skipping via column-level min/max statistics and pruning non-relevant data chunks during BI queries.
+
+ |
+| **Power BI Import Mode**
+
+ | Delivers instant cross-filtering and dashboard responsiveness without consuming continuous SQL Warehouse cluster compute hours.
+
+ |
 
 ---
 
 ## Repository Structure
-    ├── README.md
-    ├── .gitignore
-    ├── Dashboard/
-    │   └── Power BI file (.pbix)
-    ├── data/
-    │   └── samples/
-    │       ├── raw_data_sample.csv
-    │       ├── full_load_sample.csv
-    │       └── incremental_load_sample.csv
-    ├── docs/
-    │   ├── DAV_Project_Proposal.docx
-    │   └── Final architecture report (PDF)
-    └── Notebooks/
-        ├── 01_Setup.ipynb
-        ├── 02_ingest_api.ipynb
-        ├── 03_raw_to_bronze.ipynb
-        ├── 04_bronze_to_silver.ipynb
-        ├── 05_silver_to_gold.ipynb
-        └── Complaint-Analytics-Pipeline.ipynb
+
+```text
+├── README.md
+├── .gitignore
+├── Dashboard/
+│   └── Consumer_Complaint_Analytics.pbix
+├── data/
+│   └── samples/
+│       ├── raw_data_sample.csv
+│       ├── full_load_sample.csv
+│       └── incremental_load_sample.csv
+├── docs/
+│   ├── DAV_Project_Proposal.docx
+│   └── Consumer_Financial_Complaint_Analytics_Report.pdf
+└── Notebooks/
+    ├── 01_Setup.ipynb
+    ├── 02_ingest_api.ipynb
+    ├── 03_raw_to_bronze.ipynb
+    ├── 04_bronze_to_silver.ipynb
+    ├── 05_silver_to_gold.ipynb
+    └── Complaint-Analytics-Pipeline.ipynb
+
+```
 
 ---
 
-## Security & Privacy
-The CFPB dataset does not include customer names, account numbers, or transaction amounts. It contains only complaint metadata (company, product, state, dates, response status), and ZIP codes arrive already partly masked by the source (for example `604XX`), so they are stored as strings. No direct personal identifiers are present, so no additional hashing or masking is required.
+## Security, Privacy & PII Handling
+
+To adhere to GLBA, CCPA, and general consumer privacy standards, the pipeline omits unstructured narrative text fields (`complaint_what_happened`) at the Bronze-to-Silver boundary. Only standardized categorical dispute metrics, institutional entity names, dates, and partially masked postal codes (`604XX`) are ingested into the analytical model, eliminating the risk of exposing personal financial records or individual customer identifiers. All workspace secrets and API endpoints are accessed securely via Databricks execution contexts.
